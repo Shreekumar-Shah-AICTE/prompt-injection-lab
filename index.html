@@ -655,7 +655,7 @@
         </div>
     </div>
     <div class="header-right">
-        <button class="preset-btn" onclick="resetApiKey()" style="margin-right: 12px;">🔑 Reset API Key</button>
+        <button class="preset-btn" onclick="resetApiKey()" style="margin-right: 8px;">🔑 Reset API Key</button>
         <span class="status-badge red">⚔️ Red Team</span>
         <span class="status-badge green">🛡️ Defense</span>
     </div>
@@ -985,39 +985,53 @@ function sanitizeOutput(output) {
 }
 
 // ==================== API FUNCTIONS ====================
+const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+
 async function callGemini(prompt, systemPrompt) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${API_KEY}`;
+    for (const model of MODELS) {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`;
 
-    let retries = 3;
-    while (retries >= 0) {
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                system_instruction: { parts: [{ text: systemPrompt }] },
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: {
-                    temperature: 0.7,
-                    maxOutputTokens: 500
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        system_instruction: { parts: [{ text: systemPrompt }] },
+                        contents: [{ parts: [{ text: prompt }] }],
+                        generationConfig: {
+                            temperature: 0.7,
+                            maxOutputTokens: 500
+                        }
+                    })
+                });
+
+                if (response.status === 429) {
+                    console.warn(`Rate limited on ${model}, waiting ${(attempt + 1) * 2}s...`);
+                    await new Promise(r => setTimeout(r, (attempt + 1) * 2000));
+                    continue;
                 }
-            })
-        });
 
-        if (response.status === 429 && retries > 0) {
-            console.warn("Rate limit hit, retrying in 2 seconds...");
-            await new Promise(r => setTimeout(r, 2000));
-            retries--;
-            continue;
+                if (response.status === 404) {
+                    console.warn(`Model ${model} not found, trying next...`);
+                    break; // try next model
+                }
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`API Error ${response.status}: ${errorText.substring(0, 120)}`);
+                }
+
+                const data = await response.json();
+                return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response generated.';
+            } catch (err) {
+                if (err.message.startsWith('API Error')) throw err;
+                if (attempt === 2) throw err;
+                await new Promise(r => setTimeout(r, 1000));
+            }
         }
-
-        if (!response.ok) {
-            let errorText = await response.text();
-            throw new Error(`API Error: ${response.status} - ${errorText.substring(0, 100)}...`);
-        }
-
-        const data = await response.json();
-        return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response generated.';
     }
+    throw new Error('All models failed. Please check your API key and try again.');
 }
 
 // ==================== UI FUNCTIONS ====================
@@ -1155,7 +1169,9 @@ async function sendPrompt() {
     if (currentMode !== 'defense') addMessage('redMessages', prompt, 'user', 'You (Attacker)');
     if (currentMode !== 'attack') addMessage('greenMessages', prompt, 'user', 'You (Attacker)');
 
-    // === UNPROTECTED PANEL ===
+    // === SEQUENTIAL EXECUTION (avoids rate limits) ===
+
+    // STEP 1: UNPROTECTED PANEL (send first, wait for response)
     if (currentMode !== 'defense') {
         addTyping('redMessages');
         try {
@@ -1168,7 +1184,12 @@ async function sendPrompt() {
         }
     }
 
-    // === DEFENDED PANEL ===
+    // Small delay between requests to avoid burst rate limits
+    if (currentMode === 'split') {
+        await new Promise(r => setTimeout(r, 1000));
+    }
+
+    // STEP 2: DEFENDED PANEL (send after unprotected completes)
     if (currentMode !== 'attack') {
         // Layer 1: Input Validation
         const detectedPatterns = detectInjection(prompt);
